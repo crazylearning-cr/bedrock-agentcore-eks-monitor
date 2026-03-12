@@ -377,50 +377,95 @@ Expected (~60s): agent creates a JIRA ticket and sends a Slack notification.
 
 ---
 
-### Scenario 4 — Node NotReady / MemoryPressure (JIRA + Slack escalation)
+### Scenario 4 — Node NotReady (JIRA + Slack escalation)
 
-When a node enters `MemoryPressure` or goes `NotReady`, Prometheus fires a `KubeNodeNotReady` alert → Alertmanager sends the webhook → AgentCore cordons the node and escalates to JIRA and Slack.
+When a node goes `NotReady`, Prometheus fires a `KubeNodeNotReady` alert → Alertmanager sends the webhook → AgentCore investigates and escalates to JIRA and Slack.
 
-No manual trigger needed — this fires automatically when a node becomes unhealthy.
+> **Note:** `kubectl cordon` only sets `SchedulingDisabled` — it does **not** change the `Ready` condition and will **not** trigger this alert. Use one of the two methods below.
 
-**Watch it fire:**
+---
+
+#### Option A — Stop kubelet via SSM (real NotReady — verified ✅)
+
+Stops the kubelet on the node so Kubernetes marks it `NotReady`. Prometheus fires the alert automatically.
+
 ```bash
+# Get the EC2 instance ID for the node you want to make NotReady
+INSTANCE_ID=$(aws ec2 describe-instances \
+  --filters "Name=private-ip-address,Values=<NODE_PRIVATE_IP>" \
+  --query 'Reservations[0].Instances[0].InstanceId' \
+  --output text --region us-east-1)
+
+echo "Instance: $INSTANCE_ID"
+
+# Stop the kubelet — node transitions to NotReady in ~40s
+aws ssm send-command \
+  --instance-ids $INSTANCE_ID \
+  --document-name "AWS-RunShellScript" \
+  --parameters commands="sudo systemctl stop kubelet" \
+  --region us-east-1
+
+# Watch the node flip to NotReady
 kubectl get nodes -w
+
+# Watch the agent investigate and escalate
 kubectl logs -n alertmanager-agent deployment/alertmanager-webhook-server -f
 ```
 
-**Manual webhook POST (for testing without a real node failure):**
-```bash
-# Port-forward the webhook server first
-kubectl port-forward svc/alertmanager-webhook-server -n alertmanager-agent 8091:80 &
-
-curl -s -X POST http://localhost:8091/api/investigate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "status": "firing",
-    "alerts": [
-      {
-        "status": "firing",
-        "labels": {
-          "alertname": "NodeNotReady",
-          "namespace": "default",
-          "node": "ip-10-0-1-100.ec2.internal",
-          "severity": "critical"
-        },
-        "annotations": {
-          "summary": "Node ip-10-0-1-100.ec2.internal is NotReady",
-          "description": "Node ip-10-0-1-100.ec2.internal has been NotReady for more than 5 minutes."
-        },
-        "fingerprint": "nodenotready123456789abcdef0123456"
-      }
-    ],
-    "commonAnnotations": {
-      "summary": "Node NotReady — investigate and remediate"
-    }
-  }' | jq .
+Expected output in agent logs (~60s):
+```
+INFO:__main__:Webhook received: status=firing alerts=2
+INFO:__main__:Invoking AgentCore Runtime arn:aws:bedrock-agentcore:...
+INFO:__main__:Agent response: {"response": "Escalated: Slack notified"}
 ```
 
-Expected: agent cordons the node, creates a JIRA ticket, and sends a Slack notification.
+**Restore the node after the demo:**
+```bash
+aws ssm send-command \
+  --instance-ids $INSTANCE_ID \
+  --document-name "AWS-RunShellScript" \
+  --parameters commands="sudo systemctl start kubelet" \
+  --region us-east-1
+
+# Wait for node to come back Ready, then uncordon if needed
+kubectl get nodes -w
+kubectl uncordon <NODE_NAME>
+```
+
+---
+
+#### Option B — Inject alert directly into Alertmanager (no real node change)
+
+Posts a fake firing alert straight to Alertmanager, which routes it through to the webhook and AgentCore. The agent queries the live cluster and escalates. Useful to verify the full alerting pipeline without touching nodes.
+
+```bash
+kubectl port-forward -n monitoring \
+  svc/monitoring-kube-prometheus-alertmanager 9093:9093 &
+
+# Use a real node name from your cluster
+NODE=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+
+curl -s -X POST http://localhost:9093/api/v2/alerts \
+  -H "Content-Type: application/json" \
+  -d "[{
+    \"labels\": {
+      \"alertname\": \"KubeNodeNotReady\",
+      \"node\": \"$NODE\",
+      \"namespace\": \"default\",
+      \"severity\": \"critical\"
+    },
+    \"annotations\": {
+      \"summary\": \"Node $NODE is NotReady\",
+      \"description\": \"Node $NODE has been NotReady for more than 5 minutes.\"
+    },
+    \"endsAt\": \"2099-01-01T00:00:00Z\"
+  }]" | jq .
+
+# Watch agent respond
+kubectl logs -n alertmanager-agent deployment/alertmanager-webhook-server -f
+```
+
+Expected: alert routes through Alertmanager → webhook → AgentCore → `Escalated: Slack notified`.
 
 ---
 
