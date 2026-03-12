@@ -37,7 +37,21 @@ cd "$INFRA_DIR"
 echo "==> terraform init"
 terraform init -upgrade -input=false
 
-# ── Step 2: Import pre-existing resources ─────────────────────
+# ── Step 2: Ensure .build dir and placeholder exist ───────────
+# data "local_file" "agentcore_runtime_id" is read during every
+# terraform import refresh. If the file is absent the refresh
+# errors and the import is silently skipped (|| true), causing
+# terraform apply to try to CREATE resources that already exist
+# in AWS (EntityAlreadyExists / RepositoryAlreadyExistsException).
+# A placeholder satisfies the data source until the real runtime
+# deploy script overwrites it with the actual ID.
+mkdir -p "$INFRA_DIR/.build"
+if [ ! -f "$INFRA_DIR/.build/agentcore_runtime_id.txt" ]; then
+  echo "placeholder" > "$INFRA_DIR/.build/agentcore_runtime_id.txt"
+  echo "  Created .build/agentcore_runtime_id.txt placeholder"
+fi
+
+# ── Step 3: Import pre-existing resources ─────────────────────
 # Each block checks AWS/K8s first, then checks Terraform state.
 # Only imports if the resource exists but is not yet in state.
 
@@ -109,7 +123,7 @@ if kubectl get service alertmanager-webhook-server -n alertmanager-agent &>/dev/
     kubernetes_service.webhook_server "alertmanager-agent/alertmanager-webhook-server"
 fi
 
-# ── Step 3: Apply ─────────────────────────────────────────────
+# ── Step 4: Apply ─────────────────────────────────────────────
 echo ""
 echo "==> terraform apply"
 terraform apply \

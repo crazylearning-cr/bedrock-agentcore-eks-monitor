@@ -172,6 +172,8 @@ bash deploy.sh
 
 > **JIRA and Slack are optional.** Without them, OOM and CrashLoopBackOff auto-remediation still works.
 
+> **Important — API token must be on a single line.** JIRA API tokens are long and can appear to wrap in terminals. If you paste a multi-line token into your shell, zsh will interpret the second line as a command and error with `zsh: command not found: -BHx...`. Always set `TF_VAR_jira_api_token` as one unbroken line, or store it in `.env` to avoid this.
+
 Expected outputs:
 
 ```
@@ -207,7 +209,8 @@ kubectl get pods -n monitoring
 ### Step 7 — Apply Alert Rules and Demo App
 
 ```bash
-# PrometheusRules: OOMKilled, CrashLoopBackOff, ImagePullBackOff
+# PrometheusRules: OOMKilled, CrashLoopBackOff, ImagePullBackOff,
+#                  NodeNotReady, MemoryPressure, PodPending, CreateContainerConfigError
 kubectl apply -f monitoring/demo-app-alerts.yaml
 
 # Demo app with a low 64Mi memory limit (easy to OOMKill)
@@ -252,9 +255,11 @@ bedrock-agentcore-eks-monitor/
 │   ├── Dockerfile                # linux/arm64 (AgentCore runs on Graviton)
 │   └── requirements.txt
 ├── app/                          # Demo apps for testing
-│   ├── test-crash.yaml           # Deployment that OOMKills repeatedly
-│   ├── test-crashloop.yaml       # Deployment that exits immediately (CrashLoopBackOff)
-│   └── test-imagepull.yaml       # Deployment with bad image (ImagePullBackOff)
+│   ├── test-crash.yaml           # Scenario 1: OOMKilled (stress pod, 32Mi limit)
+│   ├── test-crashloop.yaml       # Scenario 2: CrashLoopBackOff (exits immediately)
+│   ├── test-imagepull.yaml       # Scenario 3: ImagePullBackOff (bad image tag)
+│   ├── test-pending.yaml         # Scenario 5: PodPending (requests 100Gi/50 CPU)
+│   └── test-missing-secret.yaml  # Scenario 6: CreateContainerConfigError (missing secret)
 ├── infra/                        # Terraform — deploy from here
 │   ├── agentcore_runtime.tf      # AgentCore Runtime + S3 artifact
 │   ├── agentcore_iam.tf          # IAM roles (AgentCore execution + IRSA)
@@ -384,7 +389,80 @@ kubectl get nodes -w
 kubectl logs -n alertmanager-agent deployment/alertmanager-webhook-server -f
 ```
 
+**Manual webhook POST (for testing without a real node failure):**
+```bash
+# Port-forward the webhook server first
+kubectl port-forward svc/alertmanager-webhook-server -n alertmanager-agent 8091:80 &
+
+curl -s -X POST http://localhost:8091/api/investigate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "status": "firing",
+    "alerts": [
+      {
+        "status": "firing",
+        "labels": {
+          "alertname": "NodeNotReady",
+          "namespace": "default",
+          "node": "ip-10-0-1-100.ec2.internal",
+          "severity": "critical"
+        },
+        "annotations": {
+          "summary": "Node ip-10-0-1-100.ec2.internal is NotReady",
+          "description": "Node ip-10-0-1-100.ec2.internal has been NotReady for more than 5 minutes."
+        },
+        "fingerprint": "nodenotready123456789abcdef0123456"
+      }
+    ],
+    "commonAnnotations": {
+      "summary": "Node NotReady — investigate and remediate"
+    }
+  }' | jq .
+```
+
 Expected: agent cordons the node, creates a JIRA ticket, and sends a Slack notification.
+
+---
+
+### Scenario 5 — PodPending / Insufficient Resources (JIRA + Slack escalation)
+
+Deploys a pod requesting `100Gi` RAM and `50` CPUs — far exceeding what any `t3.medium` node can provide. The pod stays `Pending` indefinitely. After 2 minutes, AgentCore investigates and escalates.
+
+```bash
+kubectl apply -f app/test-pending.yaml
+
+# Watch it stay stuck in Pending
+kubectl get pods -n default -w
+kubectl describe pod -l app=demo-app-pending   # shows "Insufficient memory/cpu"
+```
+
+**Watch agent escalate:**
+```bash
+kubectl logs -n alertmanager-agent deployment/alertmanager-webhook-server -f
+```
+
+Expected (~2 min): `DemoAppPodPending` alert fires → agent investigates → creates JIRA ticket and sends Slack notification.
+
+---
+
+### Scenario 6 — CreateContainerConfigError / Missing Secret (JIRA + Slack escalation)
+
+Deploys a pod that references a `Secret` which does not exist (`nonexistent-db-secret`). Kubernetes cannot start the container. After 1 minute, AgentCore investigates and escalates.
+
+```bash
+kubectl apply -f app/test-missing-secret.yaml
+
+# Watch it stuck in CreateContainerConfigError
+kubectl get pods -n default -w
+kubectl describe pod -l app=demo-app-missing-secret   # shows secret not found
+```
+
+**Watch agent escalate:**
+```bash
+kubectl logs -n alertmanager-agent deployment/alertmanager-webhook-server -f
+```
+
+Expected (~1 min): `DemoAppCreateContainerConfigError` alert fires → agent cannot auto-fix → creates JIRA ticket and sends Slack notification.
 
 ---
 
@@ -393,11 +471,74 @@ Expected: agent cordons the node, creates a JIRA ticket, and sends a Slack notif
 ```bash
 # Delete all test deployments
 kubectl delete deployment demo-app-crashing demo-app-crashloop demo-app-imagepull \
+  demo-app-pending demo-app-missing-secret \
   -n default --ignore-not-found
 
 # Stop port-forward
 pkill -f "port-forward.*8091"
 ```
+
+---
+
+## Troubleshooting
+
+### `deployments.apps "webhook-agent" not found in namespace "monitoring"`
+
+The webhook server in this repo is deployed to the **`alertmanager-agent`** namespace (not `monitoring`) and is named **`alertmanager-webhook-server`** (not `webhook-agent`).
+
+Use these commands to tail logs:
+
+```bash
+# Correct
+kubectl logs -n alertmanager-agent deploy/alertmanager-webhook-server -f
+
+# Verify the pod is running
+kubectl get pods -n alertmanager-agent
+```
+
+---
+
+### `EntityAlreadyExists` / `RepositoryAlreadyExistsException` during `terraform apply`
+
+**Symptom:** `deploy.sh` prints import lines but then `terraform apply` fails with errors like:
+
+```
+Error: creating IAM OIDC Provider: EntityAlreadyExists: Provider with url ... already exists.
+Error: creating ECR Repository (k8s-agent): RepositoryAlreadyExistsException: The repository ... already exists.
+```
+
+**Root cause:** The import step in `deploy.sh` runs `terraform import` for pre-existing resources. If `infra/.build/agentcore_runtime_id.txt` does not yet exist, Terraform fails to read the `data "local_file" "agentcore_runtime_id"` data source during the import refresh, causing the imports to silently fail (the `|| true` lets the script continue). When `terraform apply` then runs, it tries to create resources that already exist in AWS.
+
+**Fix — run once, then re-run `bash deploy.sh` normally:**
+
+```bash
+# 1. Create the placeholder file so Terraform data source reads succeed
+mkdir -p infra/.build
+echo "placeholder" > infra/.build/agentcore_runtime_id.txt
+
+# 2. Import the existing ECR repository
+cd infra
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+terraform import -var="aws_account_id=$ACCOUNT_ID" \
+  aws_ecr_repository.k8s_agent k8s-agent
+
+# 3. Import the existing OIDC provider
+OIDC_URL=$(aws eks describe-cluster --name demo-cluster --region us-east-1 \
+  --query 'cluster.identity.oidc.issuer' --output text)
+OIDC_HOST="${OIDC_URL#https://}"
+terraform import -var="aws_account_id=$ACCOUNT_ID" \
+  aws_iam_openid_connect_provider.eks \
+  "arn:aws:iam::${ACCOUNT_ID}:oidc-provider/${OIDC_HOST}"
+
+# 4. Apply — the placeholder is replaced by the real runtime ID during apply
+terraform apply \
+  -var="aws_account_id=$ACCOUNT_ID" \
+  -var="agentcore_container_image=${ACCOUNT_ID}.dkr.ecr.us-east-1.amazonaws.com/k8s-agent:latest" \
+  -auto-approve
+cd ..
+```
+
+After this one-time fix, subsequent `bash deploy.sh` runs will work normally because `.build/agentcore_runtime_id.txt` will contain the real runtime ID written by the deploy script.
 
 ---
 
